@@ -17,71 +17,169 @@
 namespace local_fakeai;
 
 /**
- * Reads an OpenAI-shaped chat completions request, extracts a scripted set of
- * steps from the first user message, and emits a deterministic response.
+ * Reads an OpenAI-shaped chat completions request, parses commands from the
+ * most recent user message, and emits a deterministic response. Conversation
+ * inspection (last user text, attached files) lives here so {@see command_parser}
+ * stays focused on text-to-step conversion.
  *
  * @package    local_fakeai
  * @copyright  2026 Marina Glancy
  * @license    http://www.gnu.org/copyleft/gpl.html GNU GPL v3 or later
  */
 class script_runner {
-
-    /** Regex used to locate the embedded script in the user message. */
-    public const SCRIPT_PATTERN = '/\[\[FAKEAI:\s*(.*?)\]\]/s';
-
     /** Default text returned when the script is exhausted or absent. */
     public const DEFAULT_FINAL_TEXT = '[fakeai] script complete';
+
+    /** Marker tool_aiagent uses to append attachment metadata to a message. */
+    public const ATTACHED_FILES_MARKER = "\n\nAttached files:";
 
     /** @var array Parsed JSON request body. */
     protected array $request;
 
+    /**
+     * Constructor.
+     *
+     * @param array $request Decoded OpenAI chat completions request body.
+     */
     public function __construct(array $request) {
         $this->request = $request;
     }
 
     /**
-     * Top-level dispatch: extract script, locate current position, emit response.
+     * Top-level dispatch: extract commands, locate current position, emit response.
      */
     public function run(): void {
         $messages = $this->request['messages'] ?? [];
-        [$script, $scriptindex] = $this->find_script($messages);
-        $yielded = $this->count_assistant_messages_after($messages, $scriptindex);
-        error_log("[fakeai] scriptindex=$scriptindex yielded=$yielded script="
-            . json_encode($script));
+        $lastuserindex = $this->find_last_user_message_index($messages);
+        $usertext = self::extract_last_user_message($messages);
+        $script = (new command_parser())->parse($usertext);
+        $yielded = $this->count_assistant_messages_after($messages, $lastuserindex);
         $this->execute_from($script, $yielded);
     }
 
     /**
-     * Find the most recent user message containing a [[FAKEAI: ... ]] block.
-     * The latest one wins so a chat session can run several independent scripts;
-     * counting yields is then scoped to assistant messages emitted after this point.
+     * Return the text of the most recent user message with the trailing
+     * "Attached files:" section (appended by tool_aiagent's
+     * `message::get_content_for_provider()`) stripped off.
      *
-     * @return array{0: array, 1: int} [script steps, message index] — index -1 if not found
+     * @param array $messages OpenAI-shaped messages array.
+     * @return string Empty string if no user message is present.
      */
-    protected function find_script(array $messages): array {
-        $foundscript = [];
-        $foundindex = -1;
-        foreach ($messages as $i => $msg) {
+    public static function extract_last_user_message(array $messages): string {
+        for ($i = \count($messages) - 1; $i >= 0; $i--) {
+            $msg = $messages[$i];
             if (($msg['role'] ?? '') !== 'user') {
                 continue;
             }
-            $content = $this->message_content_as_string($msg['content'] ?? '');
-            if (preg_match(self::SCRIPT_PATTERN, $content, $m)) {
-                $decoded = json_decode(trim($m[1]), true);
-                if (\is_array($decoded)) {
-                    $foundscript = $decoded;
-                    $foundindex = $i;
+            $content = self::message_content_as_string($msg['content'] ?? '');
+            return self::strip_attached_files_section($content);
+        }
+        return '';
+    }
+
+    /**
+     * Extract all attached files referenced in the conversation, in chronological order.
+     *
+     * For `role=user` messages: parses the lines following the
+     * "Attached files:" marker — format `- name (mime, size[, dims]): url`.
+     * For `role=tool` messages: matches any http(s) URL inside the raw content.
+     *
+     * @param array $messages OpenAI-shaped messages array.
+     * @return array<int,array> List of `{role, url, name?, mime?, size?, dimensions?}`.
+     */
+    public static function extract_files_from_conversation(array $messages): array {
+        $files = [];
+        foreach ($messages as $msg) {
+            $role = $msg['role'] ?? '';
+            $content = self::message_content_as_string($msg['content'] ?? '');
+            if ($role === 'user') {
+                foreach (self::parse_attached_files_section($content) as $file) {
+                    $file['role'] = 'user';
+                    $files[] = $file;
+                }
+            } else if ($role === 'tool') {
+                foreach (self::extract_urls_from_text($content) as $url) {
+                    $files[] = ['role' => 'tool', 'url' => $url];
                 }
             }
         }
-        return [$foundscript, $foundindex];
+        return $files;
+    }
+
+    /**
+     * Strip everything from the "Attached files:" marker onward.
+     *
+     * @param string $content Raw message content.
+     * @return string Content with the attachments section removed.
+     */
+    protected static function strip_attached_files_section(string $content): string {
+        $pos = strpos($content, self::ATTACHED_FILES_MARKER);
+        if ($pos === false) {
+            return $content;
+        }
+        return substr($content, 0, $pos);
+    }
+
+    /**
+     * Parse the "- name (meta): url" lines from a user message's attached-files section.
+     *
+     * @param string $content Raw message content.
+     * @return array<int,array> Entries with `name`, `url`, `mime`, `size`, optional `dimensions`.
+     */
+    protected static function parse_attached_files_section(string $content): array {
+        $pos = strpos($content, self::ATTACHED_FILES_MARKER);
+        if ($pos === false) {
+            return [];
+        }
+        $tail = substr($content, $pos + \strlen(self::ATTACHED_FILES_MARKER));
+        $result = [];
+        foreach (preg_split('/\r?\n/', $tail) as $line) {
+            $line = trim($line);
+            if ($line === '' || $line[0] !== '-') {
+                continue;
+            }
+            if (!preg_match('/^-\s*(.+?)\s*\((.+?)\):\s*(\S+)$/', $line, $m)) {
+                continue;
+            }
+            $meta = array_map('trim', explode(',', $m[2]));
+            $entry = [
+                'name' => $m[1],
+                'url' => $m[3],
+                'mime' => $meta[0] ?? '',
+                'size' => $meta[1] ?? '',
+            ];
+            if (isset($meta[2])) {
+                $entry['dimensions'] = $meta[2];
+            }
+            $result[] = $entry;
+        }
+        return $result;
+    }
+
+    /**
+     * Match all http(s) URLs in a free-form text blob.
+     *
+     * Stops at whitespace and common JSON delimiters so URLs embedded in JSON
+     * tool-result payloads come out clean.
+     *
+     * @param string $text Free-form text to scan.
+     * @return array<int,string> Unique URLs in order of first occurrence.
+     */
+    protected static function extract_urls_from_text(string $text): array {
+        if (!preg_match_all('#https?://[^\s"\',)\]}]+#', $text, $m)) {
+            return [];
+        }
+        return array_values(array_unique($m[0]));
     }
 
     /**
      * OpenAI allows message content to be either a string or an array of parts.
-     * Flatten any structure to a single string for script extraction.
+     * Flatten any structure to a single string for parsing.
+     *
+     * @param mixed $content Raw `content` value from a message object.
+     * @return string Flattened text representation.
      */
-    protected function message_content_as_string(mixed $content): string {
+    protected static function message_content_as_string(mixed $content): string {
         if (\is_string($content)) {
             return $content;
         }
@@ -100,8 +198,27 @@ class script_runner {
     }
 
     /**
+     * Index of the most recent user message, or -1 if none.
+     *
+     * @param array $messages OpenAI-shaped messages array.
+     * @return int
+     */
+    protected function find_last_user_message_index(array $messages): int {
+        for ($i = \count($messages) - 1; $i >= 0; $i--) {
+            if (($messages[$i]['role'] ?? '') === 'user') {
+                return $i;
+            }
+        }
+        return -1;
+    }
+
+    /**
      * Number of assistant messages after the given index — equal to the number
      * of yielding steps the fake has already emitted for the current script.
+     *
+     * @param array $messages OpenAI-shaped messages array.
+     * @param int $afterindex Position of the current script's user message.
+     * @return int
      */
     protected function count_assistant_messages_after(array $messages, int $afterindex): int {
         $count = 0;
@@ -119,6 +236,9 @@ class script_runner {
     /**
      * Walk the script, locate the yielding step this turn should emit, apply
      * any side-effects between the previous yield and that step, then yield.
+     *
+     * @param array $script Parsed list of step objects.
+     * @param int $alreadyyielded Number of yields already emitted in prior round-trips.
      */
     protected function execute_from(array $script, int $alreadyyielded): void {
         $yieldcount = 0;
@@ -150,6 +270,8 @@ class script_runner {
 
     /**
      * Run a non-yielding step (e.g. wait). Unknown steps no-op.
+     *
+     * @param array $step Step object.
      */
     protected function apply_side_effect(array $step): void {
         $action = $step['action'] ?? '';
@@ -163,6 +285,8 @@ class script_runner {
 
     /**
      * Run a yielding step (tool_call, tool_calls, http_error) and emit response.
+     *
+     * @param array $step Step object.
      */
     protected function apply_yield(array $step): void {
         $action = $step['action'] ?? '';
@@ -194,6 +318,9 @@ class script_runner {
 
     /**
      * Yielding steps end the turn and trigger another round-trip (or terminate).
+     *
+     * @param array $step Step object.
+     * @return bool
      */
     protected function is_yielding_step(array $step): bool {
         $action = $step['action'] ?? '';
@@ -202,6 +329,8 @@ class script_runner {
 
     /**
      * Emit a final assistant text response shaped like OpenAI chat completions.
+     *
+     * @param string $content Assistant message body.
      */
     protected function emit_text(string $content): void {
         $body = [
@@ -269,6 +398,9 @@ class script_runner {
 
     /**
      * Emit an OpenAI-shaped error response with a non-2xx status.
+     *
+     * @param int $status HTTP status code to emit.
+     * @param string $message Error message echoed to the client.
      */
     protected function emit_http_error(int $status, string $message): void {
         http_response_code($status);

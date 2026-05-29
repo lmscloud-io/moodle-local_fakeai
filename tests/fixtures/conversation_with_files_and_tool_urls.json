@@ -1,0 +1,32 @@
+{
+    "messages": [
+        {"role": "system", "content": "system prompt"},
+        {
+            "role": "user",
+            "content": "Please look at these.\n\nAttached files:\n- diagram.png (image/png, 12.3 KB, 800x600): {wwwroot}/pluginfile.php/1/tool_aiagent/attachments/42/diagram.png?token=abc\n- notes.txt (text/plain, 1.2 KB): {wwwroot}/pluginfile.php/1/tool_aiagent/attachments/42/notes.txt?token=def"
+        },
+        {
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "read_file", "arguments": "{\"url\":\"{wwwroot}/pluginfile.php/1/tool_aiagent/attachments/42/notes.txt?token=def\"}"}}]
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": "{\"success\":true,\"mime\":\"text/plain\",\"size\":1234,\"url\":\"{wwwroot}/pluginfile.php/1/tool_aiagent/attachments/42/notes.txt?token=def\",\"preview\":\"hello world\"}"
+        },
+        {
+            "role": "user",
+            "content": "follow up question, no attachments here"
+        },
+        {
+            "role": "assistant",
+            "content": "Here you go: see {wwwroot}/pluginfile.php/1/tool_aiagent/attachments/55/report.pdf"
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_2",
+            "content": "{\"generated\":[{\"url\":\"{wwwroot}/pluginfile.php/1/tool_aiagent/attachments/55/report.pdf\",\"size\":50000},{\"url\":\"{wwwroot}/pluginfile.php/1/tool_aiagent/attachments/55/cover.png\",\"size\":3000}]}"
+        }
+    ]
+}
