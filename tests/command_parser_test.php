@@ -55,9 +55,17 @@ final class command_parser_test extends \advanced_testcase {
             ],
 
             // Single tool call.
-            'tool no args' => [
+            'tool without defaults, no args' => [
+                '/no_default_tool',
+                [['action' => 'tool_call', 'name' => 'no_default_tool', 'arguments' => []]],
+            ],
+            'tool with default args picks up the default' => [
                 '/get_unix_timestamp',
-                [['action' => 'tool_call', 'name' => 'get_unix_timestamp', 'arguments' => []]],
+                [[
+                    'action' => 'tool_call',
+                    'name' => 'get_unix_timestamp',
+                    'arguments' => ['iso8601' => '2026-01-01'],
+                ]],
             ],
             'tool with json5 args (unquoted key)' => [
                 '/get_unix_timestamp{iso8601:"2026-01-01"}',
@@ -66,6 +74,125 @@ final class command_parser_test extends \advanced_testcase {
                     'name' => 'get_unix_timestamp',
                     'arguments' => ['iso8601' => '2026-01-01'],
                 ]],
+            ],
+            'tool with default args, user override wins' => [
+                '/get_unix_timestamp{iso8601:"2027-02-15"}',
+                [[
+                    'action' => 'tool_call',
+                    'name' => 'get_unix_timestamp',
+                    'arguments' => ['iso8601' => '2027-02-15'],
+                ]],
+            ],
+            'partial user args merge with defaults' => [
+                '/crop_image{x:50}',
+                [[
+                    'action' => 'tool_call',
+                    'name' => 'crop_image',
+                    'arguments' => [
+                        'file_url' => '@LASTFILE@',
+                        'x' => 50,
+                        'y' => 0,
+                        'width' => 100,
+                        'height' => 100,
+                    ],
+                ]],
+            ],
+            'bare LASTFILE token becomes sentinel' => [
+                '/crop_image{file_url:LASTFILE,x:0,y:0,width:50,height:50}',
+                [[
+                    'action' => 'tool_call',
+                    'name' => 'crop_image',
+                    'arguments' => [
+                        'file_url' => '@LASTFILE@',
+                        'x' => 0,
+                        'y' => 0,
+                        'width' => 50,
+                        'height' => 50,
+                    ],
+                ]],
+            ],
+            'bare CURRENTUSER token in defaults' => [
+                '/core_enrol_get_users_courses',
+                [[
+                    'action' => 'tool_call',
+                    'name' => 'core_enrol_get_users_courses',
+                    'arguments' => ['userid' => '@CURRENTUSER@'],
+                ]],
+            ],
+            // Shortcuts.
+            '/read expands to core_enrol_get_users_courses with CURRENTUSER' => [
+                '/read',
+                [[
+                    'action' => 'tool_call',
+                    'name' => 'core_enrol_get_users_courses',
+                    'arguments' => ['userid' => '@CURRENTUSER@'],
+                ]],
+            ],
+            '/readfail expands with userid -1 overriding the default' => [
+                '/readfail',
+                [[
+                    'action' => 'tool_call',
+                    'name' => 'core_enrol_get_users_courses',
+                    'arguments' => ['userid' => -1],
+                ]],
+            ],
+            '/safe expands to create_files with one canned file' => [
+                '/safe',
+                [[
+                    'action' => 'tool_call',
+                    'name' => 'create_files',
+                    'arguments' => ['files' => [['filename' => 'a.txt', 'content' => 'a']]],
+                ]],
+            ],
+            '/safefail expands to create_files with empty files array' => [
+                '/safefail',
+                [[
+                    'action' => 'tool_call',
+                    'name' => 'create_files',
+                    'arguments' => ['files' => []],
+                ]],
+            ],
+            'user arg overrides shortcut canned arg' => [
+                '/read{userid:5}',
+                [[
+                    'action' => 'tool_call',
+                    'name' => 'core_enrol_get_users_courses',
+                    'arguments' => ['userid' => 5],
+                ]],
+            ],
+            '/write expands to core_course_update_courses with COURSEID' => [
+                '/write',
+                [[
+                    'action' => 'tool_call',
+                    'name' => 'core_course_update_courses',
+                    'arguments' => ['courses' => [['id' => '@COURSEID@', 'visible' => true]]],
+                ]],
+            ],
+            '/writefail expands to x_mod_folder_update_module with no args' => [
+                '/writefail',
+                [[
+                    'action' => 'tool_call',
+                    'name' => 'x_mod_folder_update_module',
+                    'arguments' => [],
+                ]],
+            ],
+            'shortcut works inside a parallel batch' => [
+                '[/read,/safe]',
+                [[
+                    'action' => 'tool_calls',
+                    'calls' => [
+                        ['name' => 'core_enrol_get_users_courses', 'arguments' => ['userid' => '@CURRENTUSER@']],
+                        ['name' => 'create_files', 'arguments' => ['files' => [['filename' => 'a.txt', 'content' => 'a']]]],
+                    ],
+                ]],
+            ],
+
+            'unknown bare identifier stays as JSON literal (fails decode)' => [
+                // FOO isn't a placeholder and isn't true/false/null, so the
+                // JSON5 parser passes it through unquoted, json_decode rejects
+                // the whole blob, and arguments fall back to empty.
+                '/tool{x:FOO}',
+                [['action' => 'tool_call', 'name' => 'tool', 'arguments' => []]],
             ],
             'tool with single-quoted string' => [
                 "/tool{msg:'hello world'}",
@@ -149,6 +276,20 @@ final class command_parser_test extends \advanced_testcase {
             'error code with unquoted message' => [
                 'error 401 unauthorized',
                 [['action' => 'http_error', 'status' => 401, 'message' => 'unauthorized']],
+            ],
+
+            // Self-healing errorfix command.
+            'errorfix code only' => [
+                'errorfix 500',
+                [['action' => 'errorfix', 'status' => 500, 'message' => 'Simulated error']],
+            ],
+            'errorfix with quoted message' => [
+                'errorfix 429 "transient failure"',
+                [['action' => 'errorfix', 'status' => 429, 'message' => 'transient failure']],
+            ],
+            'errorfix with bare message' => [
+                'errorfix 401 unauthorized',
+                [['action' => 'errorfix', 'status' => 401, 'message' => 'unauthorized']],
             ],
 
             // Whitespace tolerance.

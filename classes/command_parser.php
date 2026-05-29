@@ -39,6 +39,62 @@ namespace local_fakeai;
  */
 class command_parser {
     /**
+     * Bare-identifier values that resolve to runtime context. Encoded as
+     * `@TOKEN@` strings in the parsed output; {@see script_runner} substitutes
+     * the real value (last attachment URL, current user id, …) at emit time.
+     */
+    public const PLACEHOLDERS = ['LASTFILE', 'CURRENTUSER', 'COURSEID'];
+
+    /**
+     * Default arguments for known tools — applied when a `/name` call omits them.
+     * User-provided keys override defaults; missing keys fall back. Placeholder
+     * sentinels (e.g. `@LASTFILE@`) are kept as-is and resolved later.
+     */
+    public const DEFAULTS = [
+        'get_unix_timestamp' => ['iso8601' => '2026-01-01'],
+        'crop_image' => [
+            'file_url' => '@LASTFILE@',
+            'x' => 0,
+            'y' => 0,
+            'width' => 100,
+            'height' => 100,
+        ],
+        'core_enrol_get_users_courses' => ['userid' => '@CURRENTUSER@'],
+    ];
+
+    /**
+     * Short aliases that expand to a full `{name, arguments}` pair. Override
+     * order at parse time is (lowest to highest precedence):
+     *   DEFAULTS[canonical name] < alias arguments < user-provided arguments.
+     */
+    public const ALIASES = [
+        'read' => [
+            'name' => 'core_enrol_get_users_courses',
+            'arguments' => ['userid' => '@CURRENTUSER@'],
+        ],
+        'readfail' => [
+            'name' => 'core_enrol_get_users_courses',
+            'arguments' => ['userid' => -1],
+        ],
+        'safe' => [
+            'name' => 'create_files',
+            'arguments' => ['files' => [['filename' => 'a.txt', 'content' => 'a']]],
+        ],
+        'safefail' => [
+            'name' => 'create_files',
+            'arguments' => ['files' => []],
+        ],
+        'write' => [
+            'name' => 'core_course_update_courses',
+            'arguments' => ['courses' => [['id' => '@COURSEID@', 'visible' => true]]],
+        ],
+        'writefail' => [
+            'name' => 'x_mod_folder_update_module',
+            'arguments' => [],
+        ],
+    ];
+
+    /**
      * Parse a text blob into a list of command step arrays.
      *
      * @param string $text
@@ -128,6 +184,16 @@ class command_parser {
                 'message' => $message,
             ];
         }
+        // Self-healing error: yields the error the first time the script runs,
+        // skipped on retry so the next command takes over.
+        if (preg_match('/^errorfix\s+(\d{3})(?:\s+(.+))?$/is', $segment, $m)) {
+            $message = isset($m[2]) ? $this->unquote(trim($m[2])) : 'Simulated error';
+            return [
+                'action' => 'errorfix',
+                'status' => (int) $m[1],
+                'message' => $message,
+            ];
+        }
         // Parallel batch in square brackets.
         if ($segment[0] === '[' && substr($segment, -1) === ']') {
             return $this->parse_batch($segment);
@@ -175,11 +241,19 @@ class command_parser {
         if (!preg_match('/^\/([A-Za-z_][\w]*)\s*(\{.*\})?\s*$/s', $segment, $m)) {
             return null;
         }
-        $arguments = [];
-        if (!empty($m[2])) {
-            $arguments = $this->parse_json5($m[2]);
+        $name = $m[1];
+        $userargs = !empty($m[2]) ? $this->parse_json5($m[2]) : [];
+        // Expand a short alias (e.g. `/read`) to its canonical tool name and
+        // seed any canned arguments. User-provided args still win per-key.
+        $aliasargs = [];
+        if (isset(self::ALIASES[$name])) {
+            $alias = self::ALIASES[$name];
+            $name = $alias['name'];
+            $aliasargs = $alias['arguments'] ?? [];
         }
-        return ['name' => $m[1], 'arguments' => $arguments];
+        $defaults = self::DEFAULTS[$name] ?? [];
+        $arguments = array_merge($defaults, $aliasargs, $userargs);
+        return ['name' => $name, 'arguments' => $arguments];
     }
 
     /**
@@ -268,7 +342,8 @@ class command_parser {
                 }
                 continue;
             }
-            // Bare identifier — quote it if it's a key (followed by `:`).
+            // Bare identifier — quote it if it's a key, encode it if it's a
+            // known placeholder token, otherwise pass it through (true/false/null).
             if (ctype_alpha($ch) || $ch === '_' || $ch === '$') {
                 $start = $i;
                 while ($i < $len && (ctype_alnum($s[$i]) || $s[$i] === '_' || $s[$i] === '$')) {
@@ -281,6 +356,8 @@ class command_parser {
                 }
                 if ($j < $len && $s[$j] === ':') {
                     $out .= '"' . $ident . '"';
+                } else if (\in_array($ident, self::PLACEHOLDERS, true)) {
+                    $out .= '"@' . $ident . '@"';
                 } else {
                     $out .= $ident;
                 }

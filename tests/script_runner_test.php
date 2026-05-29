@@ -22,8 +22,7 @@ namespace local_fakeai;
  * @package    local_fakeai
  * @copyright  2026 Marina Glancy
  * @license    http://www.gnu.org/copyleft/gpl.html GNU GPL v3 or later
- * @covers     \local_fakeai\script_runner::extract_last_user_message
- * @covers     \local_fakeai\script_runner::extract_files_from_conversation
+ * @covers     \local_fakeai\script_runner
  */
 final class script_runner_test extends \advanced_testcase {
     /**
@@ -265,5 +264,236 @@ final class script_runner_test extends \advanced_testcase {
             ],
         ];
         $this->assertSame($expected, $files);
+    }
+
+    /**
+     * Last attachment URL is the URL of the final file in the chronological list.
+     */
+    public function test_resolve_last_file_url(): void {
+        global $CFG;
+        $root = $CFG->wwwroot;
+        $messages = [
+            ['role' => 'user', 'content' => "first\n\nAttached files:\n- a.txt (text/plain, 1 B): $root/a"],
+            ['role' => 'tool', 'content' => '{"url":"' . $root . '/b"}'],
+        ];
+        $this->assertSame("$root/b", script_runner::resolve_last_file_url($messages));
+    }
+
+    /**
+     * resolve_last_file_url returns empty string when no file is referenced anywhere.
+     */
+    public function test_resolve_last_file_url_returns_empty_when_no_files(): void {
+        $messages = [
+            ['role' => 'user', 'content' => 'plain text'],
+            ['role' => 'assistant', 'content' => 'plain reply'],
+        ];
+        $this->assertSame('', script_runner::resolve_last_file_url($messages));
+    }
+
+    /**
+     * Current user id is parsed from tool_aiagent's system prompt.
+     */
+    public function test_resolve_current_user_id(): void {
+        $messages = [
+            ['role' => 'system', 'content' => "Some preface.\nThe current user ID is: 42\nMore preface."],
+            ['role' => 'user', 'content' => 'hi'],
+        ];
+        $this->assertSame(42, script_runner::resolve_current_user_id($messages));
+    }
+
+    /**
+     * resolve_current_user_id returns 0 when no system prompt mentions a user id.
+     */
+    public function test_resolve_current_user_id_returns_zero_when_absent(): void {
+        $messages = [
+            ['role' => 'system', 'content' => 'No user id here.'],
+            ['role' => 'user', 'content' => 'hi'],
+        ];
+        $this->assertSame(0, script_runner::resolve_current_user_id($messages));
+    }
+
+    /**
+     * resolve_course_id returns 0 when no visible non-site course exists,
+     * picks the first qualifying course otherwise, and skips hidden courses
+     * and the site (front page) course.
+     */
+    public function test_resolve_course_id(): void {
+        global $SITE;
+        $this->resetAfterTest(true);
+
+        // No courses yet — only the front page exists, which is excluded.
+        $this->assertSame(0, script_runner::resolve_course_id());
+
+        // A hidden course must not satisfy the resolver.
+        $this->getDataGenerator()->create_course(['visible' => 0]);
+        $this->assertSame(0, script_runner::resolve_course_id());
+
+        // The first visible non-site course wins.
+        $visible = $this->getDataGenerator()->create_course(['visible' => 1]);
+        $resolved = script_runner::resolve_course_id();
+        $this->assertSame((int) $visible->id, $resolved);
+        $this->assertNotSame((int) $SITE->id, $resolved);
+    }
+
+    /**
+     * COURSEID sentinel resolves to a real course id inside an arguments structure.
+     */
+    public function test_resolve_placeholders_with_courseid(): void {
+        $this->resetAfterTest(true);
+        $course = $this->getDataGenerator()->create_course(['visible' => 1]);
+
+        $args = ['courses' => [['id' => '@COURSEID@', 'visible' => true]]];
+        $expected = ['courses' => [['id' => (int) $course->id, 'visible' => true]]];
+        $this->assertSame($expected, script_runner::resolve_placeholders($args, []));
+    }
+
+    /**
+     * Capture the JSON response emitted by run() into a decoded array.
+     *
+     * @param array $request OpenAI-shaped request body.
+     * @return array
+     */
+    protected function run_and_capture(array $request): array {
+        ob_start();
+        (new script_runner($request))->run();
+        $output = ob_get_clean();
+        return json_decode((string) $output, true) ?? [];
+    }
+
+    /**
+     * First-time errorfix yields an HTTP error and stamps the flag file so a
+     * subsequent retry within the TTL window can recover.
+     */
+    public function test_errorfix_emits_error_on_first_run(): void {
+        $this->resetAfterTest();
+        $script = 'errorfix 503 "boom"';
+        // Make sure no leftover flag confuses the test.
+        script_runner::consume_errorfix_flag($script);
+
+        $body = $this->run_and_capture([
+            'messages' => [['role' => 'user', 'content' => $script]],
+        ]);
+        $this->assertArrayHasKey('error', $body);
+        $this->assertSame('503', $body['error']['code']);
+        $this->assertSame('boom', $body['error']['message']);
+        $this->assertFileExists(script_runner::errorfix_flag_path($script));
+    }
+
+    /**
+     * When the flag exists from a recent attempt, errorfix is skipped and the
+     * next yield in the script runs instead.
+     */
+    public function test_errorfix_is_skipped_when_flag_is_fresh_and_next_step_runs(): void {
+        $this->resetAfterTest();
+        $script = 'errorfix 500,/get_unix_timestamp';
+        script_runner::record_errorfix_attempt($script);
+
+        $body = $this->run_and_capture([
+            'messages' => [['role' => 'user', 'content' => $script]],
+        ]);
+        $this->assertArrayNotHasKey('error', $body);
+        $this->assertSame('tool_calls', $body['choices'][0]['finish_reason']);
+        $this->assertSame(
+            'get_unix_timestamp',
+            $body['choices'][0]['message']['tool_calls'][0]['function']['name'],
+        );
+    }
+
+    /**
+     * Flag present and errorfix is the only yielding command — fall through to
+     * the default "script complete" text response.
+     */
+    public function test_errorfix_alone_with_flag_emits_default_final_text(): void {
+        $this->resetAfterTest();
+        $script = 'errorfix 500';
+        script_runner::record_errorfix_attempt($script);
+
+        $body = $this->run_and_capture([
+            'messages' => [['role' => 'user', 'content' => $script]],
+        ]);
+        $this->assertArrayNotHasKey('error', $body);
+        $this->assertSame('stop', $body['choices'][0]['finish_reason']);
+        $this->assertSame(script_runner::DEFAULT_FINAL_TEXT, $body['choices'][0]['message']['content']);
+    }
+
+    /**
+     * A flag older than ERRORFIX_FLAG_TTL is stale, so errorfix re-fires.
+     */
+    public function test_errorfix_refires_when_flag_is_stale(): void {
+        $this->resetAfterTest();
+        $script = 'errorfix 500';
+        script_runner::record_errorfix_attempt($script);
+        // Backdate the flag so it's treated as expired.
+        touch(script_runner::errorfix_flag_path($script), time() - (script_runner::ERRORFIX_FLAG_TTL + 10));
+
+        $body = $this->run_and_capture([
+            'messages' => [['role' => 'user', 'content' => $script]],
+        ]);
+        $this->assertArrayHasKey('error', $body);
+        $this->assertSame('500', $body['error']['code']);
+    }
+
+    /**
+     * consume_errorfix_flag returns true exactly once after a record_errorfix_attempt,
+     * and the flag is always removed afterwards so the next call starts fresh.
+     */
+    public function test_consume_errorfix_flag_returns_true_once_and_clears(): void {
+        $this->resetAfterTest();
+        $key = 'test_key_' . uniqid();
+        script_runner::record_errorfix_attempt($key);
+        $this->assertTrue(script_runner::consume_errorfix_flag($key));
+        $this->assertFalse(script_runner::consume_errorfix_flag($key));
+    }
+
+    /**
+     * Attached file metadata changes between the first run and the retry must
+     * not break the flag match (the flag key is derived from the stripped text).
+     */
+    public function test_errorfix_retry_with_different_attached_files_still_matches(): void {
+        $this->resetAfterTest();
+        $script = 'errorfix 500,/get_unix_timestamp';
+        // First attempt — different attachments than the retry.
+        $first = $this->run_and_capture([
+            'messages' => [[
+                'role' => 'user',
+                'content' => "$script\n\nAttached files:\n- a.png (image/png, 1 KB): http://example.com/a.png",
+            ]],
+        ]);
+        $this->assertArrayHasKey('error', $first);
+
+        // Retry — different attachments, same script text.
+        $second = $this->run_and_capture([
+            'messages' => [[
+                'role' => 'user',
+                'content' => "$script\n\nAttached files:\n- b.png (image/png, 2 KB): http://example.com/b.png",
+            ]],
+        ]);
+        $this->assertArrayNotHasKey('error', $second);
+        $this->assertSame('tool_calls', $second['choices'][0]['finish_reason']);
+    }
+
+    /**
+     * Sentinel strings are substituted recursively in tool argument arrays.
+     */
+    public function test_resolve_placeholders(): void {
+        global $CFG;
+        $root = $CFG->wwwroot;
+        $messages = [
+            ['role' => 'system', 'content' => 'The current user ID is: 7'],
+            ['role' => 'user', 'content' => "see\n\nAttached files:\n- a.png (image/png, 1 KB): $root/last.png"],
+        ];
+        $args = [
+            'file_url' => '@LASTFILE@',
+            'x' => 0,
+            'nested' => ['userid' => '@CURRENTUSER@', 'note' => 'literal'],
+            'plain' => 'no token here',
+        ];
+        $expected = [
+            'file_url' => "$root/last.png",
+            'x' => 0,
+            'nested' => ['userid' => 7, 'note' => 'literal'],
+            'plain' => 'no token here',
+        ];
+        $this->assertSame($expected, script_runner::resolve_placeholders($args, $messages));
     }
 }

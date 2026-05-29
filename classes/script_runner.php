@@ -36,6 +36,9 @@ class script_runner {
     /** @var array Parsed JSON request body. */
     protected array $request;
 
+    /** @var bool True when the current run should treat `errorfix` as already-resolved. */
+    protected bool $errorfixrecovered = false;
+
     /**
      * Constructor.
      *
@@ -54,6 +57,9 @@ class script_runner {
         $usertext = self::extract_last_user_message($messages);
         $script = (new command_parser())->parse($usertext);
         $yielded = $this->count_assistant_messages_after($messages, $lastuserindex);
+        // Decide once per turn whether `errorfix` is in its "recovered" half-cycle.
+        // Consuming the flag now means a subsequent retry will start fresh.
+        $this->errorfixrecovered = self::consume_errorfix_flag($usertext);
         $this->execute_from($script, $yielded);
     }
 
@@ -104,6 +110,88 @@ class script_runner {
             }
         }
         return $files;
+    }
+
+    /**
+     * Substitute placeholder sentinels (`@LASTFILE@`, `@CURRENTUSER@`) inside
+     * a tool's arguments with values pulled from the conversation. Walks
+     * nested arrays so placeholders deep inside arguments still resolve.
+     *
+     * @param array $args Argument map (possibly nested).
+     * @param array $messages OpenAI-shaped messages array.
+     * @return array Argument map with sentinels replaced.
+     */
+    public static function resolve_placeholders(array $args, array $messages): array {
+        $resolved = [];
+        foreach ($args as $key => $value) {
+            if (\is_array($value)) {
+                $resolved[$key] = self::resolve_placeholders($value, $messages);
+            } else if (\is_string($value) && $value === '@LASTFILE@') {
+                $resolved[$key] = self::resolve_last_file_url($messages);
+            } else if (\is_string($value) && $value === '@CURRENTUSER@') {
+                $resolved[$key] = self::resolve_current_user_id($messages);
+            } else if (\is_string($value) && $value === '@COURSEID@') {
+                $resolved[$key] = self::resolve_course_id();
+            } else {
+                $resolved[$key] = $value;
+            }
+        }
+        return $resolved;
+    }
+
+    /**
+     * URL of the last attached file referenced anywhere in the conversation.
+     *
+     * @param array $messages OpenAI-shaped messages array.
+     * @return string Empty string if no file URL is available.
+     */
+    public static function resolve_last_file_url(array $messages): string {
+        $files = self::extract_files_from_conversation($messages);
+        if (empty($files)) {
+            return '';
+        }
+        $last = end($files);
+        return (string) ($last['url'] ?? '');
+    }
+
+    /**
+     * Id of the first visible course in the system other than the front page.
+     * Ordered by sortorder so it's deterministic.
+     *
+     * @return int 0 if no qualifying course exists.
+     */
+    public static function resolve_course_id(): int {
+        global $DB, $SITE;
+        $records = $DB->get_records_sql(
+            "SELECT id FROM {course} WHERE visible = 1 AND id <> :siteid ORDER BY sortorder, id",
+            ['siteid' => $SITE->id],
+            0,
+            1,
+        );
+        if (empty($records)) {
+            return 0;
+        }
+        return (int) reset($records)->id;
+    }
+
+    /**
+     * Current user id, extracted from the `tool_aiagent` system prompt
+     * (which contains a "The current user ID is: N" line).
+     *
+     * @param array $messages OpenAI-shaped messages array.
+     * @return int 0 if not found.
+     */
+    public static function resolve_current_user_id(array $messages): int {
+        foreach ($messages as $msg) {
+            if (($msg['role'] ?? '') !== 'system') {
+                continue;
+            }
+            $content = self::message_content_as_string($msg['content'] ?? '');
+            if (preg_match('/The current user ID is:\s*(\d+)/i', $content, $m)) {
+                return (int) $m[1];
+            }
+        }
+        return 0;
     }
 
     /**
@@ -197,6 +285,54 @@ class script_runner {
         return '';
     }
 
+    /** Seconds a stamped `errorfix` flag stays valid before being treated as stale. */
+    public const ERRORFIX_FLAG_TTL = 60;
+
+    /**
+     * Path of the flag file used by `errorfix` to know whether the same script
+     * has already errored recently. The key is hashed so the filename is safe.
+     *
+     * @param string $key Script text (or any stable identifier).
+     * @return string
+     */
+    public static function errorfix_flag_path(string $key): string {
+        global $CFG;
+        $dir = $CFG->dataroot . '/local_fakeai';
+        if (!is_dir($dir)) {
+            mkdir($dir, 0777, true);
+        }
+        return $dir . '/errorfix_' . sha1($key) . '.flag';
+    }
+
+    /**
+     * Mark a script as "errorfix just fired" so the next call within the TTL
+     * window can skip the error.
+     *
+     * @param string $key Script text.
+     */
+    public static function record_errorfix_attempt(string $key): void {
+        @file_put_contents(self::errorfix_flag_path($key), '');
+    }
+
+    /**
+     * Consume the errorfix flag for a script. Returns true if a fresh
+     * (within {@see ERRORFIX_FLAG_TTL}) flag existed — meaning errorfix
+     * should be treated as already-resolved this turn. Always clears the
+     * flag so the next call after this one starts fresh.
+     *
+     * @param string $key Script text.
+     * @return bool
+     */
+    public static function consume_errorfix_flag(string $key): bool {
+        $path = self::errorfix_flag_path($key);
+        if (!file_exists($path)) {
+            return false;
+        }
+        $fresh = (time() - filemtime($path)) <= self::ERRORFIX_FLAG_TTL;
+        @unlink($path);
+        return $fresh;
+    }
+
     /**
      * Index of the most recent user message, or -1 if none.
      *
@@ -247,6 +383,12 @@ class script_runner {
         $count = \count($script);
         for ($i = 0; $i < $count; $i++) {
             if ($this->is_yielding_step($script[$i])) {
+                // `errorfix` becomes a no-op when the flag set on the previous
+                // attempt is still fresh, so the next yield runs instead.
+                if (($script[$i]['action'] ?? '') === 'errorfix' && $this->errorfixrecovered) {
+                    $startfrom = $i + 1;
+                    continue;
+                }
                 if ($yieldcount === $alreadyyielded) {
                     $yieldindex = $i;
                     break;
@@ -307,6 +449,16 @@ class script_runner {
                 $this->emit_tool_calls($calls);
                 return;
 
+            case 'errorfix':
+                // Stamp the flag so the next retry within ERRORFIX_FLAG_TTL
+                // sees this errorfix as already-resolved and skips it.
+                self::record_errorfix_attempt(self::extract_last_user_message($this->request['messages'] ?? []));
+                $this->emit_http_error(
+                    (int)($step['status'] ?? 500),
+                    (string)($step['message'] ?? 'Simulated error'),
+                );
+                return;
+
             case 'http_error':
                 $this->emit_http_error(
                     (int)($step['status'] ?? 500),
@@ -324,7 +476,7 @@ class script_runner {
      */
     protected function is_yielding_step(array $step): bool {
         $action = $step['action'] ?? '';
-        return \in_array($action, ['tool_call', 'tool_calls', 'http_error'], true);
+        return \in_array($action, ['tool_call', 'tool_calls', 'http_error', 'errorfix'], true);
     }
 
     /**
@@ -361,15 +513,20 @@ class script_runner {
      * @param array $calls list of ['name' => string, 'arguments' => array]
      */
     protected function emit_tool_calls(array $calls): void {
+        $messages = $this->request['messages'] ?? [];
         $toolcalls = [];
         foreach (array_values($calls) as $i => $call) {
             $args = $call['arguments'] ?? [];
+            if (!\is_array($args)) {
+                $args = [];
+            }
+            $args = self::resolve_placeholders($args, $messages);
             $toolcalls[] = [
                 'id' => 'call_' . uniqid('', true) . '_' . $i,
                 'type' => 'function',
                 'function' => [
                     'name' => (string)($call['name'] ?? 'unknown_tool'),
-                    'arguments' => json_encode(\is_array($args) ? $args : []),
+                    'arguments' => json_encode($args),
                 ],
             ];
         }
@@ -403,7 +560,12 @@ class script_runner {
      * @param string $message Error message echoed to the client.
      */
     protected function emit_http_error(int $status, string $message): void {
-        http_response_code($status);
+        // Skip the status call when headers have already gone out — in PHPUnit
+        // the harness has already written some output, so `http_response_code()`
+        // would warn. The JSON body is still emitted normally.
+        if (!headers_sent()) {
+            http_response_code($status);
+        }
         $body = [
             'error' => [
                 'message' => $message,
