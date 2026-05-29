@@ -348,6 +348,61 @@ final class script_runner_test extends \advanced_testcase {
     }
 
     /**
+     * Empty script (sleep only, no tools) gets an upbeat reply.
+     */
+    public function test_final_reply_is_positive_when_no_tool_history(): void {
+        $body = $this->run_and_capture([
+            'messages' => [['role' => 'user', 'content' => 'sleep 0s']],
+        ]);
+        $this->assertStringStartsWith(script_runner::TEST_PREFIX, $body['choices'][0]['message']['content']);
+        $humour = substr($body['choices'][0]['message']['content'], \strlen(script_runner::TEST_PREFIX));
+        $this->assertContains($humour, script_runner::POSITIVE_REPLIES);
+    }
+
+    /**
+     * A successful tool result in history still routes to an upbeat reply.
+     */
+    public function test_final_reply_is_positive_when_last_tool_succeeded(): void {
+        $body = $this->run_and_capture([
+            'messages' => [
+                ['role' => 'user', 'content' => 'sleep 0s'],
+                ['role' => 'tool', 'tool_call_id' => 'call_x', 'content' => '{"value":42}'],
+            ],
+        ]);
+        $humour = substr($body['choices'][0]['message']['content'], \strlen(script_runner::TEST_PREFIX));
+        $this->assertContains($humour, script_runner::POSITIVE_REPLIES);
+    }
+
+    /**
+     * A tool result with `error:true` routes to a consoling reply.
+     */
+    public function test_final_reply_is_consoling_when_last_tool_errored(): void {
+        $body = $this->run_and_capture([
+            'messages' => [
+                ['role' => 'user', 'content' => 'sleep 0s'],
+                ['role' => 'tool', 'tool_call_id' => 'call_x', 'content' => '{"error":true,"message":"nope"}'],
+            ],
+        ]);
+        $humour = substr($body['choices'][0]['message']['content'], \strlen(script_runner::TEST_PREFIX));
+        $this->assertContains($humour, script_runner::CONSOLING_REPLIES);
+    }
+
+    /**
+     * A tool result with `denied:true` (user denied the tool call) is also
+     * treated as an "error" for the purpose of picking a consoling reply.
+     */
+    public function test_final_reply_is_consoling_when_last_tool_denied(): void {
+        $body = $this->run_and_capture([
+            'messages' => [
+                ['role' => 'user', 'content' => 'sleep 0s'],
+                ['role' => 'tool', 'tool_call_id' => 'call_x', 'content' => '{"denied":true}'],
+            ],
+        ]);
+        $humour = substr($body['choices'][0]['message']['content'], \strlen(script_runner::TEST_PREFIX));
+        $this->assertContains($humour, script_runner::CONSOLING_REPLIES);
+    }
+
+    /**
      * Capture the JSON response emitted by run() into a decoded array.
      *
      * @param array $request OpenAI-shaped request body.
@@ -413,7 +468,9 @@ final class script_runner_test extends \advanced_testcase {
         ]);
         $this->assertArrayNotHasKey('error', $body);
         $this->assertSame('stop', $body['choices'][0]['finish_reason']);
-        $this->assertSame(script_runner::DEFAULT_FINAL_TEXT, $body['choices'][0]['message']['content']);
+        $this->assertStringStartsWith(script_runner::TEST_PREFIX, $body['choices'][0]['message']['content']);
+        $humour = substr($body['choices'][0]['message']['content'], \strlen(script_runner::TEST_PREFIX));
+        $this->assertContains($humour, script_runner::POSITIVE_REPLIES);
     }
 
     /**

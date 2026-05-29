@@ -27,11 +27,42 @@ namespace local_fakeai;
  * @license    http://www.gnu.org/copyleft/gpl.html GNU GPL v3 or later
  */
 class script_runner {
-    /** Default text returned when the script is exhausted or absent. */
-    public const DEFAULT_FINAL_TEXT = '[fakeai] script complete';
-
     /** Marker tool_aiagent uses to append attachment metadata to a message. */
     public const ATTACHED_FILES_MARKER = "\n\nAttached files:";
+
+    /** Prefix added to the final reply when running under PHPUnit or Behat. */
+    public const TEST_PREFIX = '[fakeai] ';
+
+    /** Upbeat replies used when there's nothing wrong with the last tool call. */
+    public const POSITIVE_REPLIES = [
+        'Well done!',
+        'Like clockwork.',
+        'Mission accomplished. Time for a stretch?',
+        'Smooth sailing. You earned a coffee.',
+        'Beautifully done.',
+        'Done and dusted. What\'s next?',
+        'Fun fact: a group of flamingos is called a flamboyance.',
+        'Fun fact: bananas are technically berries, but strawberries aren\'t.',
+        'Fun fact: octopuses have three hearts and blue blood.',
+        'Fun fact: honey never spoils — archaeologists have eaten 3000-year-old honey.',
+        'Fun fact: the shortest war in history lasted 38 minutes.',
+        'Fun fact: a single cloud can weigh more than a million pounds.',
+        'What a wonderful day to be alive.',
+    ];
+
+    /** Consoling replies used when the last tool call reported an error. */
+    public const CONSOLING_REPLIES = [
+        'Oops — let\'s pretend that didn\'t happen.',
+        'Bad luck. Try again?',
+        'Well, that didn\'t go to plan.',
+        'Even the best of us trip sometimes.',
+        'Don\'t worry, the bug isn\'t on your side this time.',
+        'Hmm, that one got away from us.',
+        'Curses. Foiled again.',
+        'These things happen. Onwards!',
+        'A small setback. Nothing more.',
+        'Computers, eh?',
+    ];
 
     /** @var array Parsed JSON request body. */
     protected array $request;
@@ -349,6 +380,61 @@ class script_runner {
     }
 
     /**
+     * Pick a final-reply text for this turn. Consoling phrase if the most
+     * recent tool result indicates an error, otherwise an upbeat phrase
+     * (also for conversations with no tool calls yet).
+     *
+     * Prefixed with {@see TEST_PREFIX} when running under PHPUnit or Behat so
+     * tests can assert on it deterministically.
+     *
+     * @return string
+     */
+    protected function pick_final_reply(): string {
+        $messages = $this->request['messages'] ?? [];
+        $errored = self::last_tool_result_indicates_error($messages);
+        $pool = $errored ? self::CONSOLING_REPLIES : self::POSITIVE_REPLIES;
+        $reply = $pool[array_rand($pool)];
+        if (self::running_under_test_harness()) {
+            $reply = self::TEST_PREFIX . $reply;
+        }
+        return $reply;
+    }
+
+    /**
+     * Whether the most recent `role: tool` message in the conversation looks
+     * like an error. Decodes the content and looks for `error` / `denied` keys
+     * (the conventions used by `tool_aiagent`'s tool wrapper). Returns false
+     * when there's no tool history at all.
+     *
+     * @param array $messages
+     * @return bool
+     */
+    public static function last_tool_result_indicates_error(array $messages): bool {
+        for ($i = \count($messages) - 1; $i >= 0; $i--) {
+            if (($messages[$i]['role'] ?? '') !== 'tool') {
+                continue;
+            }
+            $content = self::message_content_as_string($messages[$i]['content'] ?? '');
+            $decoded = json_decode($content, true);
+            if (\is_array($decoded)) {
+                return !empty($decoded['error']) || !empty($decoded['denied']);
+            }
+            return false;
+        }
+        return false;
+    }
+
+    /**
+     * True when running under Moodle's PHPUnit or Behat harness.
+     *
+     * @return bool
+     */
+    public static function running_under_test_harness(): bool {
+        return (defined('PHPUNIT_TEST') && PHPUNIT_TEST)
+            || (defined('BEHAT_SITE_RUNNING') && BEHAT_SITE_RUNNING);
+    }
+
+    /**
      * Number of assistant messages after the given index — equal to the number
      * of yielding steps the fake has already emitted for the current script.
      *
@@ -383,8 +469,8 @@ class script_runner {
         $count = \count($script);
         for ($i = 0; $i < $count; $i++) {
             if ($this->is_yielding_step($script[$i])) {
-                // `errorfix` becomes a no-op when the flag set on the previous
-                // attempt is still fresh, so the next yield runs instead.
+                // The errorfix step becomes a no-op when the flag set on the
+                // previous attempt is still fresh, so the next yield runs instead.
                 if (($script[$i]['action'] ?? '') === 'errorfix' && $this->errorfixrecovered) {
                     $startfrom = $i + 1;
                     continue;
@@ -404,7 +490,7 @@ class script_runner {
         }
 
         if ($yieldindex < 0) {
-            $this->emit_text(self::DEFAULT_FINAL_TEXT);
+            $this->emit_text($this->pick_final_reply());
             return;
         }
         $this->apply_yield($script[$yieldindex]);
@@ -443,7 +529,7 @@ class script_runner {
             case 'tool_calls':
                 $calls = $step['calls'] ?? [];
                 if (!\is_array($calls) || empty($calls)) {
-                    $this->emit_text(self::DEFAULT_FINAL_TEXT);
+                    $this->emit_text($this->pick_final_reply());
                     return;
                 }
                 $this->emit_tool_calls($calls);

@@ -27,7 +27,9 @@ Type a comma-separated list of commands into the chat message. Commas inside `[]
 | HTTP error (message optional, quotes optional) | `error 429 "rate limited"` |
 | Self-healing error — errors once, then succeeds on retry | `errorfix 500 "transient"` |
 
-Arguments use JSON5 — unquoted keys, single-quoted strings, trailing commas, and comments all work. Anything that doesn't match a command is ignored, so casual prose alongside commands is fine; if no commands match, the chat just replies with `[fakeai] script complete`.
+Arguments use JSON5 — unquoted keys, single-quoted strings, trailing commas, and comments all work. Anything that doesn't match a command is ignored, so casual prose alongside commands is fine.
+
+When the script runs out of commands (or matched none), the chat replies with a random upbeat one-liner — `Well done!`, a fun fact, etc. If the last tool call returned an error or was denied, the reply turns consoling instead (`Bad luck. Try again?`). Under PHPUnit or Behat the reply is prefixed with `[fakeai] ` so tests can match on it deterministically.
 
 Combined example:
 
