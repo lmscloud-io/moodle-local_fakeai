@@ -24,6 +24,7 @@ Type a comma-separated list of commands into the chat message. Commas inside `[]
 | Single tool call | `/get_unix_timestamp` |
 | Tool call with JSON5 args | `/crop_image{file_url:LASTFILE,width:50,height:50}` |
 | Parallel batch | `[/get_unix_timestamp,/core_enrol_get_users_courses]` |
+| Prose + tool call(s) in one assistant message | `say:Here is the plan,/get_unix_timestamp` |
 | HTTP error (message optional, quotes optional) | `error 429 "rate limited"` |
 | Self-healing error — errors once, then succeeds on retry | `errorfix 500 "transient"` |
 

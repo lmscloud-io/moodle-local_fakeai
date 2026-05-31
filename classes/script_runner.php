@@ -71,6 +71,13 @@ class script_runner {
     protected bool $errorfixrecovered = false;
 
     /**
+     * @var string|null Assistant text staged by a preceding `say:` step, attached as the
+     * `content` of the next tool_calls emission so the fake can return prose AND tool calls in
+     * one assistant message (e.g. `say:Here is the plan,/get_unix_timestamp`).
+     */
+    protected ?string $prefacetext = null;
+
+    /**
      * Constructor.
      *
      * @param array $request Decoded OpenAI chat completions request body.
@@ -508,6 +515,9 @@ class script_runner {
             if ($seconds > 0) {
                 sleep($seconds);
             }
+        } else if ($action === 'say') {
+            // Stage prose to ride along with the next tool_calls emission.
+            $this->prefacetext = (string)($step['text'] ?? '');
         }
     }
 
@@ -625,7 +635,9 @@ class script_runner {
                 'index' => 0,
                 'message' => [
                     'role' => 'assistant',
-                    'content' => null,
+                    // A preceding `say:` step stages prose so the assistant message carries both
+                    // text and tool calls in one turn (as real models do); null otherwise.
+                    'content' => $this->prefacetext,
                     'tool_calls' => $toolcalls,
                 ],
                 'finish_reason' => 'tool_calls',

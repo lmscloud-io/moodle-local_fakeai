@@ -194,6 +194,11 @@ class command_parser {
                 'message' => $message,
             ];
         }
+        // Preface text that rides along with the next tool call(s) in one assistant message:
+        // `say:Here is the plan,/get_unix_timestamp` returns prose AND a tool call together.
+        if (preg_match('/^say:\s*(.*)$/is', $segment, $m)) {
+            return ['action' => 'say', 'text' => $m[1]];
+        }
         // Parallel batch in square brackets.
         if ($segment[0] === '[' && substr($segment, -1) === ']') {
             return $this->parse_batch($segment);
