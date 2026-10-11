@@ -15,13 +15,13 @@
 // along with Moodle.  If not, see <http://www.gnu.org/licenses/>.
 
 /**
- * Fake OpenAI-compatible chat completions endpoint.
+ * Fake OpenAI API endpoint: chat completions, Responses API and Files API.
  *
- * Test-only. Configure aiprovider_openaicompatible with API endpoint
- * "http(s)://<wwwroot>/local/fakeai/endpoint.php" — the provider will append
- * "chat/completions" as a PATH_INFO suffix, which Apache routes back to this
- * script. The actual sub-path is ignored. See classes/script_runner.php for
- * the script grammar.
+ * Test-only. Configure an OpenAI provider with the base URL
+ * "http(s)://<wwwroot>/local/fakeai/endpoint.php/v1" or the chat completions URL
+ * "http(s)://<wwwroot>/local/fakeai/endpoint.php/v1/chat/completions". The API path
+ * arrives as PATH_INFO and selects the route; anything before the known API path
+ * (such as "/v1") is ignored. See classes/script_runner.php for the script grammar.
  *
  * @package    local_fakeai
  * @copyright  2026 Marina Glancy
@@ -34,27 +34,69 @@ define('NO_DEBUG_DISPLAY', true);
 
 require(__DIR__ . '/../../config.php');
 
+use local_fakeai\files_api;
+use local_fakeai\reply;
+use local_fakeai\responses_api;
+use local_fakeai\script_runner;
+
 header('Content-Type: application/json');
 
 // Accept both PATH_INFO ("endpoint.php/chat/completions") and slasharguments-off
-// ("endpoint.php?file=/chat/completions") via the core helper. The provider also
-// allows the full URL including "/chat/completions" to be entered as the
-// apiendpoint, in which case nothing is appended and PATH_INFO is empty.
-$path = (string) get_file_argument();
-if ($path !== '' && !str_ends_with($path, 'chat/completions')) {
-    http_response_code(404);
-    echo json_encode(['error' => [
-        'message' => "Unknown fakeai route: $path. Expected '/chat/completions' or no sub-path.",
-        'type' => 'fakeai_error',
-        'code' => '404',
-    ]]);
+// ("endpoint.php?file=/chat/completions") via the core helper. The full URL including
+// "/chat/completions" can also be entered as the endpoint, in which case nothing is
+// appended and PATH_INFO is empty.
+$path = rtrim((string) get_file_argument(), '/');
+$method = strtoupper($_SERVER['REQUEST_METHOD'] ?? 'POST');
+
+/**
+ * Decoded JSON request body, or an empty array.
+ *
+ * @return array
+ */
+function local_fakeai_json_body(): array {
+    $body = json_decode((string) file_get_contents('php://input'), true);
+    return is_array($body) ? $body : [];
+}
+
+if ($path === '' || str_ends_with($path, 'chat/completions')) {
+    (new script_runner(local_fakeai_json_body()))->run();
     die;
 }
 
-$raw = file_get_contents('php://input');
-$body = json_decode($raw, true);
-if (!is_array($body)) {
-    $body = [];
+if (preg_match('#(?:^|/)responses(?:/([^/]+))?$#', $path, $m)) {
+    $id = $m[1] ?? '';
+    if ($id === '' && $method === 'POST') {
+        $reply = responses_api::create(local_fakeai_json_body());
+    } else if ($id !== '' && $method === 'DELETE') {
+        $reply = responses_api::delete($id);
+    } else {
+        $reply = reply::error(405, "Method $method is not supported on $path.");
+    }
+} else if (preg_match('#(?:^|/)files(?:/([^/]+)(/content)?)?$#', $path, $m)) {
+    $id = $m[1] ?? '';
+    $content = !empty($m[2]);
+    if ($id === '' && $method === 'POST') {
+        $upload = $_FILES['file'] ?? null;
+        if (!is_array($upload) || ($upload['error'] ?? UPLOAD_ERR_NO_FILE) !== UPLOAD_ERR_OK) {
+            $reply = reply::error(400, "Missing multipart field 'file'.");
+        } else {
+            $reply = files_api::create(
+                (string) file_get_contents($upload['tmp_name']),
+                clean_param((string) $upload['name'], PARAM_FILE),
+                clean_param((string) ($upload['type'] ?? ''), PARAM_NOTAGS),
+                optional_param('purpose', '', PARAM_ALPHANUMEXT),
+            );
+        }
+    } else if ($id !== '' && $content && $method === 'GET') {
+        $reply = files_api::content($id);
+    } else if ($id !== '' && !$content && $method === 'GET') {
+        $reply = files_api::retrieve($id);
+    } else if ($id !== '' && !$content && $method === 'DELETE') {
+        $reply = files_api::delete($id);
+    } else {
+        $reply = reply::error(405, "Method $method is not supported on $path.");
+    }
+} else {
+    $reply = reply::error(404, "Unknown fakeai route: $path. Expected '/chat/completions', '/responses' or '/files'.");
 }
-
-(new \local_fakeai\script_runner($body))->run();
+$reply->send();

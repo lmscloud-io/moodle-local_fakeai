@@ -16,6 +16,7 @@
 
 namespace local_fakeai;
 
+#[\PHPUnit\Framework\Attributes\CoversClass(script_runner::class)]
 /**
  * Tests for the script_runner conversation-inspection helpers.
  *
@@ -122,6 +123,7 @@ final class script_runner_test extends \advanced_testcase {
         ];
     }
 
+    #[\PHPUnit\Framework\Attributes\DataProvider('extract_last_user_message_provider')]
     /**
      * Last user message is returned with the page context and "Attached files:" section stripped.
      *
@@ -230,6 +232,7 @@ final class script_runner_test extends \advanced_testcase {
         ];
     }
 
+    #[\PHPUnit\Framework\Attributes\DataProvider('extract_files_from_conversation_provider')]
     /**
      * Files from user attachments and tool-result URLs are returned chronologically.
      *
@@ -572,5 +575,109 @@ final class script_runner_test extends \advanced_testcase {
             'plain' => 'no token here',
         ];
         $this->assertSame($expected, script_runner::resolve_placeholders($args, $messages));
+    }
+
+    /**
+     * The user message tool_aiagent appends to deliver files read by read_file is not a new
+     * script: the script continues after it and the attachment is listed by `files`.
+     */
+    public function test_file_delivery_message_does_not_restart_the_script(): void {
+        $this->resetAfterTest();
+        $upload = files_api::create('%PDF', 'report.pdf', 'application/pdf', 'user_data')->get_json();
+
+        $body = $this->run_and_capture([
+            'messages' => [
+                ['role' => 'user', 'content' => '/read_file,files'],
+                [
+                    'role' => 'assistant',
+                    'content' => null,
+                    'tool_calls' => [[
+                        'id' => 'c1',
+                        'type' => 'function',
+                        'function' => ['name' => 'read_file', 'arguments' => '{}'],
+                    ]],
+                ],
+                ['role' => 'tool', 'tool_call_id' => 'c1', 'content' => '{"filename":"report.pdf"}'],
+                ['role' => 'user', 'content' => [
+                    ['type' => 'text', 'text' => 'Contents of report.pdf:'],
+                    ['type' => 'file', 'file' => ['file_id' => $upload['id']]],
+                ]],
+            ],
+        ]);
+        $this->assertSame(
+            script_runner::TEST_PREFIX . 'Received files: report.pdf',
+            $body['choices'][0]['message']['content'],
+        );
+    }
+
+    /**
+     * `api` names Chat Completions when run from the chat completions endpoint.
+     */
+    public function test_api_on_chat_completions(): void {
+        $body = $this->run_and_capture([
+            'messages' => [['role' => 'user', 'content' => 'api']],
+        ]);
+        $this->assertSame(
+            script_runner::TEST_PREFIX . script_runner::API_CHAT_COMPLETIONS,
+            $body['choices'][0]['message']['content'],
+        );
+    }
+
+    /**
+     * `files` reports when nothing was delivered.
+     */
+    public function test_files_without_attachments(): void {
+        $body = $this->run_and_capture([
+            'messages' => [['role' => 'user', 'content' => 'files']],
+        ]);
+        $this->assertSame(
+            script_runner::TEST_PREFIX . 'Received no files.',
+            $body['choices'][0]['message']['content'],
+        );
+    }
+
+    /**
+     * File parts of every supported shape are named, and repeated parts are listed once.
+     */
+    public function test_extract_received_file_names(): void {
+        $this->resetAfterTest();
+        $upload = files_api::create('img', 'photo.png', 'image/png', 'image')->get_json();
+        $messages = [
+            ['role' => 'user', 'content' => 'plain text is ignored'],
+            ['role' => 'user', 'content' => [
+                ['type' => 'text', 'text' => 'Contents of a.pdf, b.pdf:'],
+                ['type' => 'file', 'file' => ['file_id' => 'file-unknown', 'filename' => 'a.pdf']],
+                ['type' => 'input_file', 'file_id' => 'file-other'],
+            ]],
+            ['role' => 'user', 'content' => [
+                ['type' => 'image_url', 'image_url' => ['url' => 'ms://' . $upload['id']]],
+                ['type' => 'image_url', 'image_url' => ['url' => 'data:image/jpeg;base64,AAAA']],
+                ['type' => 'document_url', 'document_url' => 'https://example.com/docs/c.docx?x=1'],
+            ]],
+            ['role' => 'user', 'content' => [
+                ['type' => 'file', 'file' => ['file_id' => 'file-unknown', 'filename' => 'a.pdf']],
+            ]],
+        ];
+        $this->assertSame(
+            ['a.pdf', 'file-other', 'photo.png', 'data:image/jpeg', 'c.docx'],
+            script_runner::extract_received_file_names($messages),
+        );
+    }
+
+    /**
+     * compute() returns the reply as data, with placeholders resolved and the say: preface attached.
+     */
+    public function test_compute_returns_tool_calls_with_preface(): void {
+        $reply = (new script_runner([
+            'messages' => [
+                ['role' => 'system', 'content' => 'The current user ID is: 5'],
+                ['role' => 'user', 'content' => 'say:Let me check,/read'],
+            ],
+        ]))->compute();
+        $this->assertSame('tool_calls', $reply['type']);
+        $this->assertSame('Let me check', $reply['content']);
+        $this->assertCount(1, $reply['calls']);
+        $this->assertSame('core_enrol_get_users_courses', $reply['calls'][0]['name']);
+        $this->assertSame('{"userid":5}', $reply['calls'][0]['arguments']);
     }
 }

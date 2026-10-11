@@ -28,6 +28,10 @@ namespace local_fakeai;
  *   [/t1, /t2{...}, …]  invoke several tools in parallel
  *   error CODE          return HTTP CODE with a default message
  *   error CODE "msg"    return HTTP CODE with a custom message
+ *   errorfix CODE       like error, but skipped when the same script is retried
+ *   say:TEXT            prose returned together with the next tool call(s)
+ *   files               final reply listing the files the model received
+ *   api                 final reply naming the API that served the request
  *
  * Unknown commands and trailing garbage are silently ignored so partial typos
  * don't blow up the whole script. Adding a new command shape means adding one
@@ -60,6 +64,7 @@ class command_parser {
             'height' => 100,
         ],
         'core_enrol_get_users_courses' => ['userid' => '@CURRENTUSER@'],
+        'read_file' => ['file_url' => '@LASTFILE@'],
     ];
 
     /**
@@ -193,6 +198,14 @@ class command_parser {
                 'status' => (int) $m[1],
                 'message' => $message,
             ];
+        }
+        // Report the files that reached the model as content parts, as the final reply.
+        if (strtolower($segment) === 'files') {
+            return ['action' => 'files'];
+        }
+        // Report which API served the request (Chat Completions or Responses), as the final reply.
+        if (strtolower($segment) === 'api') {
+            return ['action' => 'api'];
         }
         // Preface text that rides along with the next tool call(s) in one assistant message:
         // `say:Here is the plan,/get_unix_timestamp` returns prose AND a tool call together.

@@ -1,18 +1,46 @@
 # local_fakeai
 
-Test-only Moodle plugin exposing an **OpenAI-compatible chat completions endpoint** whose responses are scripted from the chat message itself. Used in the automated test suite of [LMSCloud AI Agent](https://lmscloud.io/products/ai-agent/) to drive `tool_aiagent` (and any other consumer of [`aiprovider_openaicompatible`](https://github.com/lmscloud-io/moodle-aiprovider_openaicompatible) — also on the [Moodle plugins directory](https://moodle.org/plugins/aiprovider_openaicompatible)) deterministically without calling a real LLM.
+Test-only Moodle plugin that imitates the OpenAI API: **Chat Completions**, the **Responses API** and the **Files API**. The model's replies are scripted in the chat message itself. The automated test suite of [LMSCloud AI Agent](https://lmscloud.io/products/ai-agent/) uses it to drive `tool_aiagent` deterministically without calling a real LLM.
 
 > ⚠️ This plugin has no authentication. **Do not install on production.**
 
 ## Configuration
 
-In **Site administration → AI → AI providers → OpenAI-compatible**, create or edit an action and set:
+Configure the standard **OpenAI API provider** (`aiprovider_openai`) and its **Generate text** action:
 
 | Field | Value |
 | ----- | ----- |
-| API endpoint | `<wwwroot>/local/fakeai/endpoint.php/v1` |
 | API key | any non-empty string |
-| Model | any string |
+| API endpoint | `<wwwroot>/local/fakeai/endpoint.php/v1/chat/completions` |
+| Model | any string, for example `fake-model` (on Moodle 5.0+ choose the custom model) |
+
+On Moodle 4.5 these are site-wide settings of the provider plugin. On Moodle 5.0 and later they belong to a provider instance and its action settings.
+
+A provider plugin that asks for a base URL instead of the full chat completions URL takes `<wwwroot>/local/fakeai/endpoint.php/v1`.
+
+The site calls the fake endpoint over HTTP, so the cURL security settings must allow requests to the site's own host and port (**Site administration → General → Security → HTTP security**: *cURL blocked hosts list* and *cURL allowed ports list*).
+
+## Supported API
+
+Paths are relative to `<wwwroot>/local/fakeai/endpoint.php/v1`. Anything before the API path is ignored, so `/v1` is optional.
+
+| Request | Behaviour |
+| --- | --- |
+| `POST /chat/completions` | Runs the script from the conversation (see [Script syntax](#script-syntax)). |
+| `POST /responses` | Runs the same scripts through the Responses API. The fake stores the conversation of every response it creates, so a follow-up that carries only `previous_response_id` and the new input items continues the script. |
+| `DELETE /responses/{id}` | Deletes a stored response. |
+| `POST /files` | Multipart upload with the fields `file` and `purpose`. Files are reported as `processed` immediately. |
+| `GET /files/{id}` | Returns the file metadata. |
+| `GET /files/{id}/content` | Returns the file bytes. For `purpose=file-extract` (Moonshot), it returns a JSON envelope `{content, file_type, filename}` instead, with the file's text for text files and a `[fakeai] Extracted text of …` placeholder for anything else. |
+| `DELETE /files/{id}` | Deletes a file. |
+
+Uploaded files and stored responses are kept in `$CFG->dataroot/local_fakeai/` and never cleaned up. PHPUnit and Behat start each run with an empty dataroot.
+
+### Responses API and files in tool_aiagent
+
+`tool_aiagent` uses the Responses API with the OpenAI provider when **AI agent settings → OpenAI → API type** is *Responses API* and the model name looks like an OpenAI model (it starts with `gpt` or with `o` and a digit), for example `gpt-fake`. With any other model name it uses Chat Completions.
+
+When a tool reads a file (`read_file`), the OpenAI provider uploads it through the Files API and attaches it to the conversation as a `file` part (Chat Completions) or an `input_file` part (Responses API). The [`files`](#files) command shows which files reached the model.
 
 ## Script syntax
 
@@ -27,6 +55,8 @@ Type a comma-separated list of commands into the chat message. Commas inside `[]
 | Prose + tool call(s) in one assistant message | `say:Here is the plan,/get_unix_timestamp` |
 | HTTP error (message optional, quotes optional) | `error 429 "rate limited"` |
 | Self-healing error — errors once, then succeeds on retry | `errorfix 500 "transient"` |
+| Final reply listing the files the model received | `files` |
+| Final reply naming the API that served the request | `api` |
 
 Arguments use JSON5 — unquoted keys, single-quoted strings, trailing commas, and comments all work. Anything that doesn't match a command is ignored, so casual prose alongside commands is fine.
 
@@ -60,6 +90,7 @@ These tools have built-in defaults so the bare `/name` form works out of the box
 | `get_unix_timestamp` | `{iso8601:"2026-01-01"}` |
 | `crop_image` | `{file_url:LASTFILE, x:0, y:0, width:100, height:100}` |
 | `core_enrol_get_users_courses` | `{userid:CURRENTUSER}` |
+| `read_file` | `{file_url:LASTFILE}` |
 
 ### Placeholder tokens
 
@@ -76,6 +107,16 @@ Use these bare identifiers anywhere a value is expected (in your args or in the 
 The first call to `errorfix CODE` returns the given HTTP error. If the same message is resubmitted within 60 seconds — e.g. via tool_aiagent's **Try again** button — `errorfix` is skipped and the next command in the script runs instead. After that, the cycle resets.
 
 This makes it easy to script "first attempt fails, retry succeeds" flows like `/tool1, errorfix 500, /tool2`: the first attempt errors after `/tool1`, the retry rolls through `errorfix` and reaches `/tool2`.
+
+### `files`
+
+`files` ends the script with a reply listing the files that reached the model as message content parts, for example `Received files: report.pdf, photo.png`, or `Received no files.` when there were none. Files are named after their upload when the fake holds them, otherwise after the file name or URL in the content part. Under PHPUnit or Behat the reply is prefixed with `[fakeai] `, like the final reply.
+
+A script such as `/read_file,files` therefore checks that a file read by a tool was delivered to the model. The extra user message that carries the file is not treated as a new script, so the script continues after it.
+
+### `api`
+
+`api` ends the script with a reply naming the API that served the request: `Chat Completions` or `Responses API`, prefixed with `[fakeai] ` under PHPUnit or Behat. A scenario can end with `/get_unix_timestamp,api` to check which API the agent used.
 
 ## Talking to the endpoint with curl
 
@@ -98,4 +139,18 @@ curl -sS -X POST "$SITE/local/fakeai/endpoint.php/v1/chat/completions" \
 curl -sS -w "\nHTTP=%{http_code}\n" -X POST "$SITE/local/fakeai/endpoint.php/v1/chat/completions" \
   -H 'Content-Type: application/json' \
   -d '{"messages":[{"role":"user","content":"error 429 \"rate limited\""}]}'
+
+# Responses API: the first turn returns a function call...
+curl -sS -X POST "$SITE/local/fakeai/endpoint.php/v1/responses" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"gpt-fake","input":"/get_unix_timestamp,files"}'
+
+# ...and the follow-up sends only the tool output with the previous response id.
+curl -sS -X POST "$SITE/local/fakeai/endpoint.php/v1/responses" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"gpt-fake","previous_response_id":"resp_…","input":[{"type":"function_call_output","call_id":"call_…","output":"{}"}]}'
+
+# Upload a file, then read it back.
+curl -sS -X POST "$SITE/local/fakeai/endpoint.php/v1/files" -F purpose=user_data -F file=@report.pdf
+curl -sS "$SITE/local/fakeai/endpoint.php/v1/files/file-…/content" -o report-copy.pdf
 ```

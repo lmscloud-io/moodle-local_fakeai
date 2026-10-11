@@ -16,6 +16,7 @@
 
 namespace local_fakeai;
 
+#[\PHPUnit\Framework\Attributes\CoversClass(command_parser::class)]
 /**
  * Tests for the command_parser grammar.
  *
@@ -291,6 +292,20 @@ final class command_parser_test extends \advanced_testcase {
                 'errorfix 401 unauthorized',
                 [['action' => 'errorfix', 'status' => 401, 'message' => 'unauthorized']],
             ],
+            'api after a tool call' => [
+                '/get_unix_timestamp, api',
+                [
+                    ['action' => 'tool_call', 'name' => 'get_unix_timestamp', 'arguments' => ['iso8601' => '2026-01-01']],
+                    ['action' => 'api'],
+                ],
+            ],
+            'files after a tool call' => [
+                '/read_file, files',
+                [
+                    ['action' => 'tool_call', 'name' => 'read_file', 'arguments' => ['file_url' => '@LASTFILE@']],
+                    ['action' => 'files'],
+                ],
+            ],
 
             // Whitespace tolerance.
             'spaces around commas' => [
@@ -325,6 +340,7 @@ final class command_parser_test extends \advanced_testcase {
         ];
     }
 
+    #[\PHPUnit\Framework\Attributes\DataProvider('parse_provider')]
     /**
      * Parser turns a text blob into the expected list of command steps.
      *

@@ -22,6 +22,9 @@ namespace local_fakeai;
  * inspection (last user text, attached files) lives here so {@see command_parser}
  * stays focused on text-to-step conversion.
  *
+ * {@see compute()} returns the reply as data so {@see responses_api} can format it for
+ * the Responses API; {@see run()} formats it as a chat completion.
+ *
  * @package    local_fakeai
  * @copyright  2026 Marina Glancy
  * @license    http://www.gnu.org/copyleft/gpl.html GNU GPL v3 or later
@@ -32,6 +35,12 @@ class script_runner {
 
     /** Start of the page context tool_aiagent appends to a message sent from a chat panel. */
     public const PAGE_CONTEXT_MARKER = "\n\n[The user is currently viewing the page ";
+
+    /** The request came through the Chat Completions API. */
+    public const API_CHAT_COMPLETIONS = 'Chat Completions';
+
+    /** The request came through the Responses API. */
+    public const API_RESPONSES = 'Responses API';
 
     /** Prefix added to the final reply when running under PHPUnit or Behat. */
     public const TEST_PREFIX = '[fakeai] ';
@@ -80,19 +89,49 @@ class script_runner {
      */
     protected ?string $prefacetext = null;
 
+    /** @var string The API serving the request, one of the API_* constants. */
+    protected string $api;
+
     /**
      * Constructor.
      *
      * @param array $request Decoded OpenAI chat completions request body.
+     * @param string $api The API serving the request, one of the API_* constants.
      */
-    public function __construct(array $request) {
+    public function __construct(array $request, string $api = self::API_CHAT_COMPLETIONS) {
         $this->request = $request;
+        $this->api = $api;
     }
 
     /**
-     * Top-level dispatch: extract commands, locate current position, emit response.
+     * Top-level dispatch for chat completions: compute the reply and emit it.
      */
     public function run(): void {
+        $reply = $this->compute();
+        switch ($reply['type']) {
+            case 'error':
+                $this->emit_http_error($reply['status'], $reply['message']);
+                return;
+            case 'tool_calls':
+                $this->emit_tool_calls($reply['content'], $reply['calls']);
+                return;
+            default:
+                $this->emit_text($reply['content']);
+        }
+    }
+
+    /**
+     * Extract commands, locate the current position in the script and work out the reply.
+     *
+     * The reply is one of:
+     * - `['type' => 'text', 'content' => string]`
+     * - `['type' => 'tool_calls', 'content' => ?string, 'calls' => [['id', 'name', 'arguments'], ...]]`
+     *   where `arguments` is a JSON string and `content` is the text staged by `say:`
+     * - `['type' => 'error', 'status' => int, 'message' => string]`
+     *
+     * @return array
+     */
+    public function compute(): array {
         $messages = $this->request['messages'] ?? [];
         $lastuserindex = $this->find_last_user_message_index($messages);
         $usertext = self::extract_last_user_message($messages);
@@ -101,7 +140,31 @@ class script_runner {
         // Decide once per turn whether `errorfix` is in its "recovered" half-cycle.
         // Consuming the flag now means a subsequent retry will start fresh.
         $this->errorfixrecovered = self::consume_errorfix_flag($usertext);
-        $this->execute_from($script, $yielded);
+        return $this->execute_from($script, $yielded);
+    }
+
+    /**
+     * Whether a message is something the user typed (and therefore carries the script).
+     *
+     * tool_aiagent delivers files read by `read_file` in an extra user message after the
+     * tool results, made of non-text parts (`file`, `input_file`, `image_url`, ...) and an
+     * optional "Contents of ..." text part. Such a message is not a new script.
+     *
+     * @param array $msg OpenAI-shaped message.
+     * @return bool
+     */
+    protected static function is_user_script_message(array $msg): bool {
+        if (($msg['role'] ?? '') !== 'user') {
+            return false;
+        }
+        if (\is_array($msg['content'] ?? null)) {
+            foreach ($msg['content'] as $part) {
+                if (\is_array($part) && !\in_array($part['type'] ?? 'text', ['text', 'input_text'], true)) {
+                    return false;
+                }
+            }
+        }
+        return true;
     }
 
     /**
@@ -115,7 +178,7 @@ class script_runner {
     public static function extract_last_user_message(array $messages): string {
         for ($i = \count($messages) - 1; $i >= 0; $i--) {
             $msg = $messages[$i];
-            if (($msg['role'] ?? '') !== 'user') {
+            if (!self::is_user_script_message($msg)) {
                 continue;
             }
             $content = self::message_content_as_string($msg['content'] ?? '');
@@ -398,7 +461,7 @@ class script_runner {
      */
     protected function find_last_user_message_index(array $messages): int {
         for ($i = \count($messages) - 1; $i >= 0; $i--) {
-            if (($messages[$i]['role'] ?? '') === 'user') {
+            if (self::is_user_script_message($messages[$i])) {
                 return $i;
             }
         }
@@ -487,8 +550,9 @@ class script_runner {
      *
      * @param array $script Parsed list of step objects.
      * @param int $alreadyyielded Number of yields already emitted in prior round-trips.
+     * @return array Reply, see {@see compute()}.
      */
-    protected function execute_from(array $script, int $alreadyyielded): void {
+    protected function execute_from(array $script, int $alreadyyielded): array {
         $yieldcount = 0;
         $startfrom = 0;
         $yieldindex = -1;
@@ -516,10 +580,9 @@ class script_runner {
         }
 
         if ($yieldindex < 0) {
-            $this->emit_text($this->pick_final_reply());
-            return;
+            return self::text_reply($this->pick_final_reply());
         }
-        $this->apply_yield($script[$yieldindex]);
+        return $this->apply_yield($script[$yieldindex]);
     }
 
     /**
@@ -541,45 +604,48 @@ class script_runner {
     }
 
     /**
-     * Run a yielding step (tool_call, tool_calls, http_error) and emit response.
+     * Run a yielding step (tool_call, tool_calls, http_error, errorfix, files) and return the reply.
      *
      * @param array $step Step object.
+     * @return array Reply, see {@see compute()}.
      */
-    protected function apply_yield(array $step): void {
+    protected function apply_yield(array $step): array {
         $action = $step['action'] ?? '';
         switch ($action) {
             case 'tool_call':
-                $this->emit_tool_calls([[
+                return $this->tool_calls_reply([[
                     'name' => (string)($step['name'] ?? 'unknown_tool'),
                     'arguments' => $step['arguments'] ?? [],
                 ]]);
-                return;
 
             case 'tool_calls':
                 $calls = $step['calls'] ?? [];
                 if (!\is_array($calls) || empty($calls)) {
-                    $this->emit_text($this->pick_final_reply());
-                    return;
+                    return self::text_reply($this->pick_final_reply());
                 }
-                $this->emit_tool_calls($calls);
-                return;
+                return $this->tool_calls_reply($calls);
 
             case 'errorfix':
                 // Stamp the flag so the next retry within ERRORFIX_FLAG_TTL
                 // sees this errorfix as already-resolved and skips it.
                 self::record_errorfix_attempt(self::extract_last_user_message($this->request['messages'] ?? []));
-                $this->emit_http_error(
+                return self::error_reply(
                     (int)($step['status'] ?? 500),
                     (string)($step['message'] ?? 'Simulated error'),
                 );
-                return;
+
+            case 'files':
+                return self::text_reply($this->files_reply_text());
+
+            case 'api':
+                return self::text_reply(self::with_test_prefix($this->api));
 
             case 'http_error':
-                $this->emit_http_error(
+            default:
+                return self::error_reply(
                     (int)($step['status'] ?? 500),
                     (string)($step['message'] ?? 'Simulated error'),
                 );
-                return;
         }
     }
 
@@ -591,7 +657,132 @@ class script_runner {
      */
     protected function is_yielding_step(array $step): bool {
         $action = $step['action'] ?? '';
-        return \in_array($action, ['tool_call', 'tool_calls', 'http_error', 'errorfix'], true);
+        return \in_array($action, ['tool_call', 'tool_calls', 'http_error', 'errorfix', 'files', 'api'], true);
+    }
+
+    /**
+     * Reply text for the `files` command: the names of the files that reached the model
+     * as message content parts, prefixed like the final reply under test harnesses.
+     *
+     * @return string
+     */
+    protected function files_reply_text(): string {
+        $names = self::extract_received_file_names($this->request['messages'] ?? []);
+        return self::with_test_prefix(empty($names) ? 'Received no files.' : 'Received files: ' . implode(', ', $names));
+    }
+
+    /**
+     * Prefix a reply with {@see TEST_PREFIX} when running under PHPUnit or Behat.
+     *
+     * @param string $text
+     * @return string
+     */
+    protected static function with_test_prefix(string $text): string {
+        return self::running_under_test_harness() ? self::TEST_PREFIX . $text : $text;
+    }
+
+    /**
+     * Names of the files delivered to the model as non-text content parts, in order of first
+     * appearance. Chat Completions resends the whole history every turn, so each file is
+     * listed once.
+     *
+     * Understands `file` and `input_file` parts (named after the uploaded file when the id is
+     * known to {@see files_api}, otherwise after the part's own filename or id), and
+     * `image_url`/`document_url` parts (named after the uploaded file for Moonshot's `ms://<id>`,
+     * the MIME type for `data:` URLs, and the last path segment for anything else).
+     *
+     * @param array $messages OpenAI-shaped messages array.
+     * @return string[]
+     */
+    public static function extract_received_file_names(array $messages): array {
+        $names = [];
+        foreach ($messages as $msg) {
+            if (!\is_array($msg['content'] ?? null)) {
+                continue;
+            }
+            foreach ($msg['content'] as $part) {
+                $name = \is_array($part) ? self::file_part_name($part) : null;
+                if ($name !== null && !\in_array($name, $names, true)) {
+                    $names[] = $name;
+                }
+            }
+        }
+        return $names;
+    }
+
+    /**
+     * Display name of a single file content part, or null for text and unknown parts.
+     *
+     * @param array $part Content part.
+     * @return string|null
+     */
+    protected static function file_part_name(array $part): ?string {
+        $type = $part['type'] ?? '';
+        if ($type === 'file' || $type === 'input_file') {
+            $file = $type === 'file' ? ($part['file'] ?? []) : $part;
+            $id = (string) ($file['file_id'] ?? '');
+            $metadata = $id !== '' ? files_api::get_metadata($id) : null;
+            return (string) ($metadata['filename'] ?? $file['filename'] ?? ($id ?: 'file'));
+        }
+        if ($type === 'image_url' || $type === 'document_url') {
+            $url = $part[$type] ?? '';
+            $url = (string) (\is_array($url) ? ($url['url'] ?? '') : $url);
+            if (str_starts_with($url, 'ms://')) {
+                $id = substr($url, \strlen('ms://'));
+                return (string) (files_api::get_metadata($id)['filename'] ?? $id);
+            }
+            if (preg_match('#^data:([^;,]+)#', $url, $m)) {
+                return 'data:' . $m[1];
+            }
+            $basename = basename((string) parse_url($url, PHP_URL_PATH));
+            return $basename !== '' ? $basename : $type;
+        }
+        return null;
+    }
+
+    /**
+     * A final-text reply.
+     *
+     * @param string $content Assistant message body.
+     * @return array
+     */
+    protected static function text_reply(string $content): array {
+        return ['type' => 'text', 'content' => $content];
+    }
+
+    /**
+     * An HTTP error reply.
+     *
+     * @param int $status HTTP status code.
+     * @param string $message Error message.
+     * @return array
+     */
+    protected static function error_reply(int $status, string $message): array {
+        return ['type' => 'error', 'status' => $status, 'message' => $message];
+    }
+
+    /**
+     * A tool-calls reply with placeholders resolved, call ids assigned and arguments encoded,
+     * carrying any prose staged by a preceding `say:` step.
+     *
+     * @param array $calls list of ['name' => string, 'arguments' => array]
+     * @return array
+     */
+    protected function tool_calls_reply(array $calls): array {
+        $messages = $this->request['messages'] ?? [];
+        $resolved = [];
+        foreach (array_values($calls) as $i => $call) {
+            $args = $call['arguments'] ?? [];
+            if (!\is_array($args)) {
+                $args = [];
+            }
+            $resolved[] = [
+                'id' => 'call_' . uniqid('', true) . '_' . $i,
+                'name' => (string)($call['name'] ?? 'unknown_tool'),
+                'arguments' => json_encode(self::resolve_placeholders($args, $messages)),
+            ];
+        }
+        return ['type' => 'tool_calls', 'content' => $this->prefacetext, 'calls' => $resolved];
     }
 
     /**
@@ -623,28 +814,30 @@ class script_runner {
     }
 
     /**
+     * Convert the calls of a tool-calls reply to the chat completions `tool_calls` format.
+     *
+     * @param array $calls Calls from a reply returned by {@see compute()}.
+     * @return array
+     */
+    public static function chat_tool_calls(array $calls): array {
+        return array_map(fn(array $call) => [
+            'id' => $call['id'],
+            'type' => 'function',
+            'function' => [
+                'name' => $call['name'],
+                'arguments' => $call['arguments'],
+            ],
+        ], $calls);
+    }
+
+    /**
      * Emit one or more tool_calls in a single assistant message.
      *
-     * @param array $calls list of ['name' => string, 'arguments' => array]
+     * @param string|null $content Prose staged by a preceding `say:` step, or null.
+     * @param array $calls Calls from a reply returned by {@see compute()}.
      */
-    protected function emit_tool_calls(array $calls): void {
-        $messages = $this->request['messages'] ?? [];
-        $toolcalls = [];
-        foreach (array_values($calls) as $i => $call) {
-            $args = $call['arguments'] ?? [];
-            if (!\is_array($args)) {
-                $args = [];
-            }
-            $args = self::resolve_placeholders($args, $messages);
-            $toolcalls[] = [
-                'id' => 'call_' . uniqid('', true) . '_' . $i,
-                'type' => 'function',
-                'function' => [
-                    'name' => (string)($call['name'] ?? 'unknown_tool'),
-                    'arguments' => json_encode($args),
-                ],
-            ];
-        }
+    protected function emit_tool_calls(?string $content, array $calls): void {
+        $toolcalls = self::chat_tool_calls($calls);
         $body = [
             'id' => 'fakeai-' . uniqid('', true),
             'object' => 'chat.completion',
@@ -656,7 +849,7 @@ class script_runner {
                     'role' => 'assistant',
                     // A preceding `say:` step stages prose so the assistant message carries both
                     // text and tool calls in one turn (as real models do); null otherwise.
-                    'content' => $this->prefacetext,
+                    'content' => $content,
                     'tool_calls' => $toolcalls,
                 ],
                 'finish_reason' => 'tool_calls',
