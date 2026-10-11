@@ -16,7 +16,7 @@ In **Site administration → AI → AI providers → OpenAI-compatible**, create
 
 ## Script syntax
 
-Type a comma-separated list of commands into the chat message. Commas inside `[]`, `{}` or strings are preserved.
+Type a comma-separated list of commands into the chat message. Commas inside `[]`, `{}` or strings are preserved. The current page and the attached files list that tool_aiagent appends to a message are stripped before parsing.
 
 | Command | Example |
 | --- | --- |

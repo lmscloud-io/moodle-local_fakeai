@@ -69,6 +69,26 @@ final class script_runner_test extends \advanced_testcase {
                 ],
                 'see',
             ],
+            'page context stripped' => [
+                [
+                    [
+                        'role' => 'user',
+                        'content' => "/read\n\n[The user is currently viewing the page $root/admin/settings.php " .
+                            "(page title: \"AI providers, LMS\").] It belongs to the System.",
+                    ],
+                ],
+                '/read',
+            ],
+            'page context and files section both stripped' => [
+                [
+                    [
+                        'role' => 'user',
+                        'content' => "sleep 1s\n\n[The user is currently viewing the page $root/my/ " .
+                            "(page title: \"Dashboard\").]\n\nAttached files:\n- a.png (image/png, 1 KB): $root/a.png",
+                    ],
+                ],
+                'sleep 1s',
+            ],
             'no user message present' => [
                 [
                     ['role' => 'system', 'content' => 'sys'],
@@ -103,7 +123,7 @@ final class script_runner_test extends \advanced_testcase {
     }
 
     /**
-     * Last user message is returned with the trailing "Attached files:" section stripped.
+     * Last user message is returned with the page context and "Attached files:" section stripped.
      *
      * @dataProvider extract_last_user_message_provider
      * @param array $messages OpenAI-shaped messages array.

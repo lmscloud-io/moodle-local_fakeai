@@ -30,6 +30,9 @@ class script_runner {
     /** Marker tool_aiagent uses to append attachment metadata to a message. */
     public const ATTACHED_FILES_MARKER = "\n\nAttached files:";
 
+    /** Start of the page context tool_aiagent appends to a message sent from a chat panel. */
+    public const PAGE_CONTEXT_MARKER = "\n\n[The user is currently viewing the page ";
+
     /** Prefix added to the final reply when running under PHPUnit or Behat. */
     public const TEST_PREFIX = '[fakeai] ';
 
@@ -103,7 +106,7 @@ class script_runner {
 
     /**
      * Return the text of the most recent user message with the trailing
-     * "Attached files:" section (appended by tool_aiagent's
+     * page context and "Attached files:" section (both appended by tool_aiagent's
      * `message::get_content_for_provider()`) stripped off.
      *
      * @param array $messages OpenAI-shaped messages array.
@@ -116,7 +119,7 @@ class script_runner {
                 continue;
             }
             $content = self::message_content_as_string($msg['content'] ?? '');
-            return self::strip_attached_files_section($content);
+            return self::strip_page_context(self::strip_attached_files_section($content));
         }
         return '';
     }
@@ -240,6 +243,22 @@ class script_runner {
      */
     protected static function strip_attached_files_section(string $content): string {
         $pos = strpos($content, self::ATTACHED_FILES_MARKER);
+        if ($pos === false) {
+            return $content;
+        }
+        return substr($content, 0, $pos);
+    }
+
+    /**
+     * Strip the page context, which tool_aiagent puts between the message and its
+     * attached files. Without this the context lands in the same comma-separated
+     * segment as the last command, and that command no longer parses.
+     *
+     * @param string $content Message content with the attachments section already removed.
+     * @return string Content with the page context removed.
+     */
+    protected static function strip_page_context(string $content): string {
+        $pos = strpos($content, self::PAGE_CONTEXT_MARKER);
         if ($pos === false) {
             return $content;
         }
