@@ -94,9 +94,9 @@ class responses_api {
             'previous_response_id' => $previousid !== '' ? $previousid : null,
             'output' => $output,
             'usage' => [
-                'input_tokens' => 0,
-                'output_tokens' => 0,
-                'total_tokens' => 0,
+                'input_tokens' => script_runner::PROMPT_TOKENS,
+                'output_tokens' => script_runner::COMPLETION_TOKENS,
+                'total_tokens' => script_runner::PROMPT_TOKENS + script_runner::COMPLETION_TOKENS,
             ],
         ]);
     }

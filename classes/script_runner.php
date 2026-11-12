@@ -45,6 +45,12 @@ class script_runner {
     /** Prefix added to the final reply when running under PHPUnit or Behat. */
     public const TEST_PREFIX = '[fakeai] ';
 
+    /** Prompt tokens every reply reports, so AI usage reports show a known value. */
+    public const PROMPT_TOKENS = 123;
+
+    /** Completion tokens every reply reports. */
+    public const COMPLETION_TOKENS = 45;
+
     /** Upbeat replies used when there's nothing wrong with the last tool call. */
     public const POSITIVE_REPLIES = [
         'Well done!',
@@ -805,9 +811,9 @@ class script_runner {
                 'finish_reason' => 'stop',
             ]],
             'usage' => [
-                'prompt_tokens' => 0,
-                'completion_tokens' => 0,
-                'total_tokens' => 0,
+                'prompt_tokens' => self::PROMPT_TOKENS,
+                'completion_tokens' => self::COMPLETION_TOKENS,
+                'total_tokens' => self::PROMPT_TOKENS + self::COMPLETION_TOKENS,
             ],
         ];
         echo json_encode($body);
@@ -855,9 +861,9 @@ class script_runner {
                 'finish_reason' => 'tool_calls',
             ]],
             'usage' => [
-                'prompt_tokens' => 0,
-                'completion_tokens' => 0,
-                'total_tokens' => 0,
+                'prompt_tokens' => self::PROMPT_TOKENS,
+                'completion_tokens' => self::COMPLETION_TOKENS,
+                'total_tokens' => self::PROMPT_TOKENS + self::COMPLETION_TOKENS,
             ],
         ];
         echo json_encode($body);

@@ -36,6 +36,8 @@ Paths are relative to `<wwwroot>/local/fakeai/endpoint.php/v1`. Anything before 
 
 Uploaded files and stored responses are kept in `$CFG->dataroot/local_fakeai/` and never cleaned up. PHPUnit and Behat start each run with an empty dataroot.
 
+Every reply reports the same token usage: 123 prompt tokens and 45 completion tokens. Tests can find these numbers in Moodle's AI usage report.
+
 ### Responses API and files in tool_aiagent
 
 `tool_aiagent` uses the Responses API with the OpenAI provider when **AI agent settings → OpenAI → API type** is *Responses API* and the model name looks like an OpenAI model (it starts with `gpt` or with `o` and a digit), for example `gpt-fake`. With any other model name it uses Chat Completions.
